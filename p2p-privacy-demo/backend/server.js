@@ -332,6 +332,7 @@ app.post("/api/negotiations/:id/decrypt", (req, res) => {
 });
 
 // Acceptare oferta de catre Supplier
+// Acceptare oferta / counter-offer -> Blocheaza banii Buyer-ului in Escrow Privat pe L2
 app.post("/api/negotiations/:id/accept", (req, res) => {
   const neg = negotiations.find((n) => n.id === Number(req.params.id));
   if (!neg) return res.status(404).json({ error: "Negotiation not found" });
@@ -354,6 +355,40 @@ app.post("/api/negotiations/:id/accept", (req, res) => {
   neg.escrowTxHash = l2TxHash;
 
   res.json({ negotiation: neg, l2TxHash });
+});
+// COUNTER-OFFER (Supplier propune un nou pret / data livrare, re-criptat pentru ambele parti)
+app.post("/api/negotiations/:id/counter-offer", (req, res) => {
+  try {
+    const { newUnitPrice, newDeliveryDate } = req.body;
+    const neg = negotiations.find((n) => n.id === Number(req.params.id));
+    if (!neg || neg.status !== "PROPOSED") {
+      return res.status(400).json({ error: "Counter-offer can only be sent on PROPOSED negotiations." });
+    }
+
+    const oldTerms = decryptFor(neg.supplierAddress, neg.encryptedForSupplier);
+    const updatedUnitPrice = Number(newUnitPrice) || oldTerms.unitPrice;
+    const updatedTerms = {
+      ...oldTerms,
+      unitPrice: updatedUnitPrice,
+      totalPrice: oldTerms.quantity * updatedUnitPrice,
+      deliveryDate: newDeliveryDate || oldTerms.deliveryDate,
+      round: (oldTerms.round || 1) + 1
+    };
+
+    neg.commitmentHash = ethers.keccak256(ethers.toUtf8Bytes(JSON.stringify(updatedTerms)));
+    neg.encryptedForSupplier = encryptFor(neg.supplierAddress, updatedTerms);
+    neg.encryptedForBuyer = encryptFor(neg.buyerAddress, updatedTerms);
+    neg.status = "COUNTER_OFFERED";
+
+    const l2TxHash = recordPrivateTx("COUNTER_OFFER", {
+      negotiationId: neg.id,
+      commitmentHash: neg.commitmentHash
+    });
+
+    res.json({ negotiation: neg, l2TxHash });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post("/api/negotiations/:id/pay", (req, res) => {
@@ -451,23 +486,32 @@ app.post("/api/withdraw", async (req, res) => {
 app.get("/api/proof/:txHash", async (req, res) => {
   try {
     const { txHash } = req.params;
+    const tamper = req.query.tamper === "true";
+
     const batch = submittedBatches.find((b) => b.leaves.includes(txHash));
     if (!batch) {
       return res.status(404).json({ error: "Tx not yet anchored in an L1 Rollup Batch. Submit Rollup Batch from FI first." });
     }
 
     const proof = getMerkleProof(batch.leaves, txHash);
-    const onChainBatch = await rollupContract.batches(batch.batchId);
+    const allBatches = await rollupContract.getAllBatches();
+    const onChainBatch = allBatches[batch.batchId];
     const l1MerkleRoot = onChainBatch.merkleRoot;
 
-    // Reconstruct root from txHash + proof
-    let computed = txHash;
+    // Daca simulam un atac, alteram ultimul caracter hex din txHash
+    const effectiveHash = tamper
+      ? txHash.slice(0, -1) + (txHash.endsWith("0") ? "1" : "0")
+      : txHash;
+
+    let computed = effectiveHash;
     for (const sibling of proof) {
       computed = hashPair(computed, sibling);
     }
 
     res.json({
       txHash,
+      testedHash: effectiveHash,
+      tampered: tamper,
       batchId: batch.batchId,
       proof,
       computedRoot: computed,
