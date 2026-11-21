@@ -67,4 +67,22 @@ contract TokenPortal {
     function getAllDeposits() external view returns (Deposit[] memory) {
         return deposits;
     }
+
+    mapping(bytes32 => bool) public processedWithdrawals;
+
+    event WithdrawalProcessed(address indexed recipient, uint256 amount, bytes32 l2TxHash);
+
+    function withdrawToL1(
+        address recipient,
+        uint256 amount,
+        bytes32 l2TxHash
+    ) external {
+        require(!processedWithdrawals[l2TxHash], "Withdrawal already processed");
+        require(token.balanceOf(address(this)) >= amount, "Insufficient portal liquidity");
+
+        processedWithdrawals[l2TxHash] = true;
+        require(token.transfer(recipient, amount), "L1 transfer failed");
+
+        emit WithdrawalProcessed(recipient, amount, l2TxHash);
+    }
 }

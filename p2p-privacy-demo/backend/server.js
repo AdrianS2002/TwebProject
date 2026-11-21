@@ -9,6 +9,9 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+const escrowBalances = {}; // negotiationId -> { amount, buyer, supplier }
+const submittedBatches = []; // { batchId, merkleRoot, leaves: [txHash, ...] }
+
 // 1. Incarca deployment.json generat la Pasul 1
 const deploymentPath = path.join(__dirname, "..", "blockchain", "deployment.json");
 if (!fs.existsSync(deploymentPath)) {
@@ -127,6 +130,7 @@ const l2Balances = {
 };
 
 const products = [];
+let nextProductId = 1;
 const negotiations = [];
 const auditNotes = [];
 let pendingL2Hashes = []; // Tranzactii private ce asteapta sa fie impachetate in Rollup
@@ -141,6 +145,43 @@ function recordPrivateTx(type, payload) {
     timestamp: new Date().toISOString()
   });
   return txHash;
+}
+
+function hashPair(a, b) {
+  const [first, second] = a.toLowerCase() < b.toLowerCase() ? [a, b] : [b, a];
+  return ethers.solidityPackedKeccak256(["bytes32", "bytes32"], [first, second]);
+}
+
+function buildMerkleTree(leaves) {
+  if (leaves.length === 0) return { root: ethers.ZeroHash, layers: [] };
+  let layer = [...leaves];
+  const layers = [layer];
+  while (layer.length > 1) {
+    const next = [];
+    for (let i = 0; i < layer.length; i += 2) {
+      const left = layer[i];
+      const right = i + 1 < layer.length ? layer[i + 1] : left;
+      next.push(hashPair(left, right));
+    }
+    layer = next;
+    layers.push(layer);
+  }
+  return { root: layer[0], layers };
+}
+
+function getMerkleProof(leaves, targetHash) {
+  const { layers } = buildMerkleTree(leaves);
+  let idx = leaves.indexOf(targetHash);
+  if (idx === -1) return null;
+  const proof = [];
+  for (let i = 0; i < layers.length - 1; i++) {
+    const layer = layers[i];
+    const isRight = idx % 2 === 1;
+    const siblingIdx = isRight ? idx - 1 : idx + 1;
+    proof.push(siblingIdx < layer.length ? layer[siblingIdx] : layer[idx]);
+    idx = Math.floor(idx / 2);
+  }
+  return proof;
 }
 
 // ================= ENDPOINTS =================
@@ -205,10 +246,11 @@ app.get("/api/products", (req, res) => {
 });
 
 app.post("/api/products", (req, res) => {
-  const { productId, name, description, supplierAddress } = req.body;
+  const {name, description, supplierAddress } = req.body;
+  const generatedId = `PROD-${String(nextProductId++).padStart(3, "0")}`;
   const item = {
     id: products.length + 1,
-    productId,
+    productId: generatedId,
     name,
     description,
     supplierAddress: supplierAddress.toLowerCase(),
@@ -225,8 +267,13 @@ app.get("/api/negotiations", (req, res) => {
 
 app.post("/api/negotiations", (req, res) => {
   try {
+    
     const { productId, buyerAddress, supplierAddress, quantity, unitPrice, deliveryDate } = req.body;
     const totalPrice = Number(quantity) * Number(unitPrice);
+
+    const product = products.find((p) => p.productId === productId);
+    const productName = product ? product.name : "Unknown Product";
+
     const terms = {
       productId,
       productName,
@@ -286,16 +333,150 @@ app.post("/api/negotiations/:id/decrypt", (req, res) => {
 
 // Acceptare oferta de catre Supplier
 app.post("/api/negotiations/:id/accept", (req, res) => {
-  const { callerAddress } = req.body;
   const neg = negotiations.find((n) => n.id === Number(req.params.id));
   if (!neg) return res.status(404).json({ error: "Negotiation not found" });
-  if (neg.supplierAddress !== callerAddress.toLowerCase()) {
-    return res.status(403).json({ error: "Only the supplier can accept" });
+
+  const terms = decryptFor(neg.buyerAddress, neg.encryptedForBuyer);
+  const buyerBal = l2Balances[neg.buyerAddress] || 0;
+  if (buyerBal < terms.totalPrice) {
+    return res.status(400).json({ error: `Buyer needs ${terms.totalPrice} EURS on L2 to lock Escrow.` });
   }
 
-  neg.status = "ACCEPTED";
-  const l2TxHash = recordPrivateTx("PRIVATE_ACCEPT", { negotiationId: neg.id, accept: true });
+  l2Balances[neg.buyerAddress] -= terms.totalPrice;
+  escrowBalances[neg.id] = {
+    amount: terms.totalPrice,
+    buyer: neg.buyerAddress,
+    supplier: neg.supplierAddress
+  };
+
+  neg.status = "ESCROW_LOCKED";
+  const l2TxHash = recordPrivateTx("ESCROW_LOCK", { negotiationId: neg.id, amount: terms.totalPrice });
+  neg.escrowTxHash = l2TxHash;
+
   res.json({ negotiation: neg, l2TxHash });
+});
+
+app.post("/api/negotiations/:id/pay", (req, res) => {
+  const neg = negotiations.find((n) => n.id === Number(req.params.id));
+  if (!neg || neg.status !== "ESCROW_LOCKED") {
+    return res.status(400).json({ error: "Negotiation is not in ESCROW_LOCKED state" });
+  }
+
+  const escrow = escrowBalances[neg.id];
+  l2Balances[escrow.supplier] = (l2Balances[escrow.supplier] || 0) + escrow.amount;
+  delete escrowBalances[neg.id];
+
+  neg.status = "PAID";
+  const invoiceId = `INV-2026-000${neg.id}`;
+  const l2TxHash = recordPrivateTx("PRIVATE_PAYMENT", { negotiationId: neg.id, invoiceId });
+  neg.paymentTxHash = l2TxHash;
+
+  // Nota AML/CFT pentru FI
+  const auditPayload = {
+    invoiceId,
+    negotiationId: neg.id,
+    from: escrow.buyer,
+    to: escrow.supplier,
+    amount: escrow.amount,
+    timestamp: new Date().toISOString()
+  };
+  auditNotes.push({
+    id: auditNotes.length + 1,
+    negotiationId: neg.id,
+    encryptedForFI: encryptFor(deployment.roles.fi, auditPayload)
+  });
+
+  res.json({ negotiation: neg, invoiceId, l2TxHash });
+});
+
+app.post("/api/negotiations/:id/dispute", (req, res) => {
+  const neg = negotiations.find((n) => n.id === Number(req.params.id));
+  if (!neg || neg.status !== "ESCROW_LOCKED") {
+    return res.status(400).json({ error: "Can only dispute an ESCROW_LOCKED order" });
+  }
+  neg.status = "DISPUTED";
+  neg.disputeReason = req.body.reason || "Delivery issue";
+  const l2TxHash = recordPrivateTx("DISPUTE_OPENED", { negotiationId: neg.id });
+  res.json({ negotiation: neg, l2TxHash });
+});
+
+app.post("/api/negotiations/:id/resolve-dispute", (req, res) => {
+  const { decision } = req.body; // 'REFUND_BUYER' | 'RELEASE_SUPPLIER'
+  const neg = negotiations.find((n) => n.id === Number(req.params.id));
+  if (!neg || neg.status !== "DISPUTED") {
+    return res.status(400).json({ error: "Negotiation is not disputed" });
+  }
+
+  const escrow = escrowBalances[neg.id];
+  if (decision === "REFUND_BUYER") {
+    l2Balances[escrow.buyer] = (l2Balances[escrow.buyer] || 0) + escrow.amount;
+    neg.status = "REFUNDED";
+  } else {
+    l2Balances[escrow.supplier] = (l2Balances[escrow.supplier] || 0) + escrow.amount;
+    neg.status = "PAID";
+  }
+  delete escrowBalances[neg.id];
+
+  const l2TxHash = recordPrivateTx("DISPUTE_RESOLVED", { negotiationId: neg.id, decision });
+  neg.paymentTxHash = l2TxHash;
+  res.json({ negotiation: neg, l2TxHash });
+});
+
+app.post("/api/withdraw", async (req, res) => {
+  try {
+    const { address, amount } = req.body;
+    const addr = address.toLowerCase();
+    const numAmount = Number(amount);
+
+    if ((l2Balances[addr] || 0) < numAmount) {
+      return res.status(400).json({ error: "Insufficient L2 private balance" });
+    }
+
+    l2Balances[addr] -= numAmount;
+    const l2TxHash = recordPrivateTx("PRIVATE_WITHDRAW", { amount: numAmount });
+
+    const tx = await portalContract.withdrawToL1(
+      address,
+      ethers.parseUnits(numAmount.toString(), 18),
+      l2TxHash
+    );
+    await tx.wait();
+
+    res.json({ l1TxHash: tx.hash, l2TxHash, newL2Balance: l2Balances[addr] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/proof/:txHash", async (req, res) => {
+  try {
+    const { txHash } = req.params;
+    const batch = submittedBatches.find((b) => b.leaves.includes(txHash));
+    if (!batch) {
+      return res.status(404).json({ error: "Tx not yet anchored in an L1 Rollup Batch. Submit Rollup Batch from FI first." });
+    }
+
+    const proof = getMerkleProof(batch.leaves, txHash);
+    const onChainBatch = await rollupContract.batches(batch.batchId);
+    const l1MerkleRoot = onChainBatch.merkleRoot;
+
+    // Reconstruct root from txHash + proof
+    let computed = txHash;
+    for (const sibling of proof) {
+      computed = hashPair(computed, sibling);
+    }
+
+    res.json({
+      txHash,
+      batchId: batch.batchId,
+      proof,
+      computedRoot: computed,
+      l1MerkleRoot,
+      verified: computed.toLowerCase() === l1MerkleRoot.toLowerCase()
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Plata privata L2 + Generare nota de audit AML/CFT pentru FI
@@ -390,17 +571,23 @@ app.post("/api/sequencer/submit-batch", async (req, res) => {
       return res.status(400).json({ error: "No pending L2 transactions to roll up." });
     }
 
-    const hashes = pendingL2Hashes.map((t) => t.txHash);
-    const merkleRoot = computeMerkleRoot(hashes);
-    const txCount = hashes.length;
+    const leaves = pendingL2Hashes.map((t) => t.txHash);
+    const { root: merkleRoot } = buildMerkleTree(leaves);
+    const txCount = leaves.length;
 
     const tx = await rollupContract.submitBatch(merkleRoot, txCount);
     const receipt = await tx.wait();
+
+    const batchCount = await rollupContract.getBatchCount();
+    const batchId = Number(batchCount) - 1;
+    const gasUsed = Number(receipt.gasUsed);
+    submittedBatches.push({ batchId, merkleRoot, leaves, gasUsed });
 
     pendingL2Hashes = [];
 
     res.json({
       success: true,
+      batchId,
       merkleRoot,
       txCount,
       l1TxHash: receipt.hash
@@ -432,7 +619,42 @@ app.get("/api/explorer", async (req, res) => {
       timestamp: new Date(Number(d.timestamp) * 1000).toISOString()
     }));
 
-    res.json({ batches, deposits });
+    const AVG_L1_TX_GAS = 65000; // Cost mediu standard pe Ethereum L1 (transfer ERC-20 / update stare)
+
+    let totalL2Txs = 0;
+    let totalRollupGas = 0;
+
+    const enrichedBatches = batches.map((b) => {
+      const localBatch = submittedBatches.find((sb) => sb.batchId === b.batchId);
+      const gasUsed = localBatch ? localBatch.gasUsed : 95000;
+      totalL2Txs += b.txCount;
+      totalRollupGas += gasUsed;
+      return {
+        ...b,
+        gasUsed,
+        gasPerTx: b.txCount > 0 ? Math.round(gasUsed / b.txCount) : gasUsed
+      };
+    });
+
+    const estimatedPureL1Gas = totalL2Txs * AVG_L1_TX_GAS;
+    const gasSaved = Math.max(0, estimatedPureL1Gas - totalRollupGas);
+    const savingsPercent =
+      estimatedPureL1Gas > 0
+        ? (((estimatedPureL1Gas - totalRollupGas) / estimatedPureL1Gas) * 100).toFixed(1)
+        : "0.0";
+
+    const benchmark = {
+      totalL2Txs,
+      totalBatches: enrichedBatches.length,
+      totalRollupGas,
+      estimatedPureL1Gas,
+      gasSaved,
+      savingsPercent: Number(savingsPercent),
+      avgGasPerL2Tx: totalL2Txs > 0 ? Math.round(totalRollupGas / totalL2Txs) : 0,
+      baselineL1GasPerTx: AVG_L1_TX_GAS
+    };
+
+    res.json({ batches: enrichedBatches, deposits, benchmark });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
