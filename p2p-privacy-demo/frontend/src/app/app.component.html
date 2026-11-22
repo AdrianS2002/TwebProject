@@ -1,0 +1,394 @@
+<div class="container">
+  <header class="topbar">
+    <div>
+      <h1>Privacy-Preserving Procure-to-Pay L1 & L2</h1>
+    </div>
+    <div class="wallet-box">
+      <button *ngIf="!account" class="btn-primary" (click)="connectMetaMask()">Connect MetaMask</button>
+      <div *ngIf="account" class="wallet-info">
+        <span class="badge">{{ role }}</span>
+        <code>{{ account.slice(0, 6) }}...{{ account.slice(-4) }}</code>
+        <div class="balances">
+          <span>L1: <strong>{{ l1Balance }} EURS</strong></span> |
+          <span>L2 Private: <strong>{{ l2Balance }} EURS</strong></span>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button *ngIf="role === 'FI'" [class.active]="activeTab === 'FI'" (click)="activeTab = 'FI'">
+      Financial Institution
+    </button>
+    <button *ngIf="role === 'SUPPLIER'" [class.active]="activeTab === 'SUPPLIER'" (click)="activeTab = 'SUPPLIER'">
+      Supplier
+    </button>
+    <button *ngIf="role === 'BUYER'" [class.active]="activeTab === 'BUYER'" (click)="activeTab = 'BUYER'">
+      Buyer
+    </button>
+    <button [class.active]="activeTab === 'EXPLORER'" (click)="activeTab = 'EXPLORER'">
+      Public Explorer
+    </button>
+  </nav>
+
+  <div *ngIf="statusMsg" class="alert success">{{ statusMsg }}</div>
+  <div *ngIf="errorMsg" class="alert error">{{ errorMsg }}</div>
+
+  <!-- TAB 1: FINANCIAL INSTITUTION -->
+  <section *ngIf="activeTab === 'FI'" class="card">
+    <h2>Financial Institution</h2>
+    <p *ngIf="role !== 'FI'" class="warn">Switch your MetaMask account to Account #0 (FI) to perform actions.</p>
+
+    <div class="grid-2">
+      <div class="subcard">
+        <h3>KYC Whitelisting & Stablecoin Minting</h3>
+        <label>EURS Amount to Mint:</label>
+        <input type="number" [(ngModel)]="mintAmount" />
+        <div class="btn-row">
+          <button class="btn-primary" [disabled]="role !== 'FI'" (click)="whitelistAndMint(config.roles.buyer)">
+            Whitelist + Mint Buyer
+          </button>
+          <button class="btn-secondary" [disabled]="role !== 'FI'" (click)="whitelistAndMint(config.roles.supplier)">
+            Whitelist + Mint Supplier
+          </button>
+        </div>
+      </div>
+
+      <div class="subcard">
+        <h3>Sequencer L2 &rarr; L1 Rollup</h3>
+        <p>Pending private transactions: <strong>{{ sequencerStatus.pendingCount }}</strong></p>
+        <button class="btn-accent" [disabled]="sequencerStatus.pendingCount === 0" (click)="submitRollupBatch()">
+          Submit Rollup Batch to L1 (Merkle Root)
+        </button>
+      </div>
+    </div>
+
+    <div class="subcard" style="margin-top: 16px;">
+      <h3>AML/CFT Audit Notes</h3>
+      <p *ngIf="auditNotes.length === 0" class="muted">No payments made yet.</p>
+      <div *ngFor="let note of auditNotes" class="item-box">
+        <div><strong>Audit #{{ note.id }}</strong> (Negotiation #{{ note.negotiationId }})</div>
+        <div class="cipher">Ciphertext: {{ note.encryptedForFI.slice(0, 70) }}...</div>
+        <button class="btn-small" [disabled]="role !== 'FI'" (click)="decryptAudit(note.id)">Decrypt Audit Note</button>
+        <pre *ngIf="decryptedAudits[note.id]">{{ decryptedAudits[note.id] | json }}</pre>
+      </div>
+    </div>
+
+    <div class="subcard" style="margin-top: 16px;">
+      <h3>Escrow Dispute Resolution (Arbitrator)</h3>
+      <div *ngFor="let n of negotiations">
+        <div *ngIf="n.status === 'DISPUTED'" class="item-box">
+          <div><strong>Disputed Order #{{ n.id }}</strong> — Reason: {{ n.disputeReason }}</div>
+          <div class="btn-row">
+            <button class="btn-primary" (click)="resolveDispute(n.id, 'REFUND_BUYER')">Refund Buyer (L2)</button>
+            <button class="btn-accent" (click)="resolveDispute(n.id, 'RELEASE_SUPPLIER')">Release to Supplier
+              (L2)</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- TAB 2: SUPPLIER -->
+  <section *ngIf="activeTab === 'SUPPLIER'" class="card">
+    <h2>Supplier</h2>
+    <p *ngIf="role !== 'SUPPLIER'" class="warn">Switch your MetaMask account to Account #1 (Supplier).</p>
+
+    <div class="subcard">
+      <h3>Product Catalog</h3>
+      <div class="form-row">
+        <input [(ngModel)]="newProduct.name" placeholder="Product Name" />
+        <input [(ngModel)]="newProduct.description" placeholder="Description" />
+        <button class="btn-primary" [disabled]="role !== 'SUPPLIER'" (click)="publishProduct()">Publish Product</button>
+      </div>
+    </div>
+
+    <div class="subcard" style="margin-top: 16px;">
+      <h3>Incoming Negotiation Requests</h3>
+      <p *ngIf="negotiations.length === 0" class="muted">No requests received yet.</p>
+      <div *ngFor="let n of negotiations" class="item-box">
+        <div><strong>Negotiation #{{ n.id }}</strong> — Product: {{ n.productId }} | Status: <span class="badge">{{ n.status }}</span></div>
+        <div class="cipher">Encrypted Note: {{ n.encryptedForSupplier.slice(0, 70) }}...</div>
+        <div class="btn-row">
+          <button class="btn-small" [disabled]="role !== 'SUPPLIER'" (click)="decryptNegotiation(n.id)">
+            Decrypt Note
+          </button>
+          <button class="btn-primary" *ngIf="n.status === 'PROPOSED'" [disabled]="role !== 'SUPPLIER'" (click)="acceptNegotiation(n.id)">
+            Accept Offer (accept: true)
+          </button>
+          <button class="btn-secondary" *ngIf="n.status === 'PROPOSED'" [disabled]="role !== 'SUPPLIER'" (click)="showCounterForm[n.id] = !showCounterForm[n.id]">
+            Send Counter-Offer
+          </button>
+        </div>
+
+        <div *ngIf="showCounterForm[n.id]" style="margin-top: 12px; padding: 12px; background: #f8fafc; border-radius: 8px; border: 1px solid #cbd5e1;">
+          <label>New Unit Price (EURS):</label>
+          <input type="number" [(ngModel)]="counterPrice[n.id]" placeholder="e.g. 15" />
+          <label>New Delivery Date (optional):</label>
+          <input type="date" [(ngModel)]="counterDate[n.id]" />
+          <button class="btn-accent" (click)="sendCounterOffer(n.id)">Submit Encrypted Counter-Offer</button>
+        </div>
+
+        <pre *ngIf="decryptedNotes[n.id]">{{ decryptedNotes[n.id] | json }}</pre>
+      </div>
+    </div>
+
+    <div class="subcard" style="margin-top: 16px;">
+      <h3>Withdraw Private L2 Funds &rarr; L1 (MetaMask)</h3>
+      <div class="form-row">
+        <input type="number" [(ngModel)]="withdrawAmount" placeholder="Amount (EURS)" />
+        <button class="btn-accent" [disabled]="role !== 'SUPPLIER'" (click)="withdrawToL1()">
+          Withdraw to MetaMask (L1)
+        </button>
+      </div>
+    </div>
+
+    <div class="subcard" style="margin-top: 16px;">
+      <h3>Product Catalog</h3>
+      <div style="margin-top: 16px;">
+        <h4>Published Products ({{ products.length }})</h4>
+        <p *ngIf="products.length === 0" class="muted">No products published yet.</p>
+        <table *ngIf="products.length > 0">
+          <thead>
+            <tr>
+              <th>Product ID</th>
+              <th>Name</th>
+              <th>Description</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr *ngFor="let p of products">
+              <td><code>{{ p.productId }}</code></td>
+              <td><strong>{{ p.name }}</strong></td>
+              <td>{{ p.description }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- TAB 3: BUYER -->
+  <section *ngIf="activeTab === 'BUYER'" class="card">
+    <h2>Buyer</h2>
+    <p *ngIf="role !== 'BUYER'" class="warn">Switch your MetaMask account to Account #2 (Buyer).</p>
+
+    <div class="grid-2">
+      <div class="subcard">
+        <h3>Step 1: Bridge L1 &rarr; L2</h3>
+        <label>Amount to lock on L1:</label>
+        <input type="number" [(ngModel)]="bridgeAmount" />
+        <label>Secret (only the hash goes on L1):</label>
+        <input [(ngModel)]="bridgeSecret" />
+        <button class="btn-primary" [disabled]="role !== 'BUYER'" (click)="lockTokensToL2()">Lock Tokens on L1</button>
+        <hr />
+        <label>Deposit ID to claim on L2:</label>
+        <input type="number" [(ngModel)]="claimDepositId" />
+        <button class="btn-accent" [disabled]="role !== 'BUYER'" (click)="claimOnL2()">Claim Private Tokens on
+          L2</button>
+      </div>
+
+      <div class="subcard">
+        <h3>Step 2: Send Private Demand</h3>
+        <label>Select Product:</label>
+        <select [(ngModel)]="newDemand.productId"
+          style="width: 100%; padding: 8px; margin-bottom: 10px; border-radius: 6px; border: 1px solid #cbd5e1;">
+          <option value="" disabled>-- Choose a product --</option>
+          <option *ngFor="let p of products" [value]="p.productId">
+            {{ p.name }} (ID: {{ p.productId }})
+          </option>
+        </select>
+        <p *ngIf="products.length === 0" class="muted" style="font-size: 12px; margin-top: -6px;">
+          No products available yet. Publish one from the Supplier tab first.
+        </p>
+        <label>Quantity:</label>
+        <input type="number" [(ngModel)]="newDemand.quantity" />
+        <label>Unit Price (EURS):</label>
+        <input type="number" [(ngModel)]="newDemand.unitPrice" />
+        <label>Delivery Date:</label>
+        <input type="date" [(ngModel)]="newDemand.deliveryDate" />
+        <button class="btn-primary" [disabled]="role !== 'BUYER'" (click)="sendPrivateDemand()">Send Private
+          Demand</button>
+      </div>
+    </div>
+
+    <div class="subcard" style="margin-top: 16px;">
+      <h3>My Orders & Private Payment</h3>
+      <div *ngFor="let n of negotiations" class="item-box">
+        <div><strong>Negotiation #{{ n.id }}</strong> — {{ n.productId }} | Status: <span class="badge">{{ n.status }}</span></div>
+        <div *ngIf="n.status === 'COUNTER_OFFERED'" class="warn" style="margin: 8px 0;">
+          Supplier sent an encrypted Counter-Offer! Click <strong>View Counter-Offer (Decrypt)</strong> to inspect the new price &amp; delivery date before accepting.
+        </div>
+        <div class="btn-row">
+          <button class="btn-small" [disabled]="role !== 'BUYER'" (click)="decryptNegotiation(n.id)">
+            {{ n.status === 'COUNTER_OFFERED' ? 'View Counter-Offer (Decrypt)' : 'View Terms (Decrypt)' }}
+          </button>
+          <button class="btn-primary" *ngIf="n.status === 'COUNTER_OFFERED'" [disabled]="role !== 'BUYER'" (click)="acceptNegotiation(n.id)">
+            Accept Counter-Offer & Lock Escrow
+          </button>
+          <button class="btn-accent" *ngIf="n.status === 'ESCROW_LOCKED'" [disabled]="role !== 'BUYER'" (click)="payPrivately(n.id)">
+            Confirm Delivery & Release Escrow
+          </button>
+          <button class="btn-secondary" *ngIf="n.status === 'ESCROW_LOCKED'" [disabled]="role !== 'BUYER'" (click)="openDispute(n.id)">
+            Open Dispute
+          </button>
+          <button class="btn-small" *ngIf="n.paymentTxHash" (click)="verifyMerkleProof(n.paymentTxHash)">
+            Verify L1 Merkle Proof
+          </button>
+        </div>
+        <pre *ngIf="decryptedNotes[n.id]">{{ decryptedNotes[n.id] | json }}</pre>
+      </div>
+    </div>
+
+    <div *ngIf="proofResult" class="subcard" style="margin-top: 16px;">
+      <h3>
+        Merkle Inclusion Proof Result (
+        <span [style.color]="proofResult.verified ? '#059669' : '#dc2626'">
+          {{ proofResult.verified ? 'VERIFIED ON L1' : 'INVALID — TAMPERED' }}
+        </span>
+        )
+      </h3>
+      <div class="btn-row" style="margin-bottom: 10px;">
+        <button class="btn-secondary" (click)="simulateTamper(proofResult.txHash)">
+          Simulate Tampering (Alter 1 Byte)
+        </button>
+        <button class="btn-accent" *ngIf="proofResult.tampered" (click)="verifyMerkleProof(proofResult.txHash)">
+          Restore & Verify Original
+        </button>
+      </div>
+      <pre>{{ proofResult | json }}</pre>
+    </div>
+
+  </section>
+
+  <!-- TAB 4: PUBLIC EXPLORER -->
+  <section *ngIf="activeTab === 'EXPLORER'" class="card">
+    <h2>Public L1 Explorer</h2>
+
+    <div class="subcard" *ngIf="explorerData.benchmark && explorerData.benchmark.totalBatches > 0"
+      style="margin-bottom: 16px;">
+      <h3>Scalability & Gas Benchmark (L2 Rollup vs. Pure L1)</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Total L2 Txs Anchored</th>
+            <th>Actual L1 Rollup Gas</th>
+            <th>Estimated Pure L1 Gas</th>
+            <th>Avg Gas / L2 Tx</th>
+            <th>Gas Savings</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>{{ explorerData.benchmark.totalL2Txs }}</strong> ({{ explorerData.benchmark.totalBatches }}
+              batch)</td>
+            <td><code>{{ explorerData.benchmark.totalRollupGas | number }} gas</code></td>
+            <td><code>{{ explorerData.benchmark.estimatedPureL1Gas | number }} gas</code></td>
+            <td><code>{{ explorerData.benchmark.avgGasPerL2Tx | number }} gas</code></td>
+            <td>
+              <strong style="color: #16a34a;">
+                {{ explorerData.benchmark.savingsPercent }}% saved ({{ explorerData.benchmark.gasSaved | number }} gas)
+              </strong>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <p class="muted" style="font-size: 12px; margin-top: 8px;">
+        *Baseline: {{ explorerData.benchmark.baselineL1GasPerTx | number }} gas/tx for standard Ethereum L1 contract
+        settlement.
+      </p>
+    </div>
+
+    <div class="benchmark-visuals">
+        <!-- DONUT / PIE CHART -->
+        <div class="chart-box">
+          <div
+            class="donut-chart"
+            [style.background]="'conic-gradient(#10b981 0% ' + explorerData.benchmark.savingsPercent + '%, #4f46e5 ' + explorerData.benchmark.savingsPercent + '% 100%)'"
+          >
+            <div class="donut-inner">
+              <strong>{{ explorerData.benchmark.savingsPercent }}%</strong>
+              <span>Gas Saved</span>
+            </div>
+          </div>
+          <div class="chart-legend">
+            <span><i class="dot green"></i> Saved Gas</span>
+            <span><i class="dot indigo"></i> L2 Rollup Cost</span>
+          </div>
+        </div>
+
+        <!-- BAR CHART COMPARATIV -->
+        <div class="bars-box">
+          <div class="bar-item">
+            <div class="bar-header">
+              <span>Pure Ethereum L1 ({{ explorerData.benchmark.totalL2Txs }} separate txs)</span>
+              <strong>{{ explorerData.benchmark.estimatedPureL1Gas | number }} gas</strong>
+            </div>
+            <div class="bar-track">
+              <div class="bar-fill l1-bar" style="width: 100%;"></div>
+            </div>
+          </div>
+
+          <div class="bar-item">
+            <div class="bar-header">
+              <span>L2 Rollup Batch (Merkle Root on L1)</span>
+              <strong>{{ explorerData.benchmark.totalRollupGas | number }} gas</strong>
+            </div>
+            <div class="bar-track">
+              <div
+                class="bar-fill l2-bar"
+                [style.width.%]="(explorerData.benchmark.totalRollupGas / explorerData.benchmark.estimatedPureL1Gas) * 100"
+              ></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    <div class="subcard">
+      <h3>Rollup Batches Anchored on L1</h3>
+      <p *ngIf="explorerData.batches.length === 0" class="muted">No batches submitted to L1 yet. Click "Submit Rollup
+        Batch" in the FI tab.</p>
+      <table *ngIf="explorerData.batches.length > 0">
+        <thead>
+          <tr>
+            <th>Batch ID</th>
+            <th>Merkle Root (L1 Commitment)</th>
+            <th>L2 Tx Count</th>
+            <th>Timestamp</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr *ngFor="let b of explorerData.batches">
+            <td>#{{ b.batchId }}</td>
+            <td><code>{{ b.merkleRoot }}</code></td>
+            <td>{{ b.txCount }}</td>
+            <td>{{ b.timestamp }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="subcard" style="margin-top: 16px;">
+      <h3>Bridge Deposits on L1</h3>
+      <p *ngIf="explorerData.deposits.length === 0" class="muted">No deposits on L1 yet.</p>
+      <table *ngIf="explorerData.deposits.length > 0">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Secret Hash (no L2 address)</th>
+            <th>Amount (EURS)</th>
+            <th>Claimed</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr *ngFor="let d of explorerData.deposits">
+            <td>#{{ d.id }}</td>
+            <td><code>{{ d.secretHash }}</code></td>
+            <td>{{ d.amount }}</td>
+            <td>{{ d.claimed ? 'YES' : 'NO' }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+</div>
